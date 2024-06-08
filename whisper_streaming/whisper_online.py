@@ -203,7 +203,7 @@ class OpenaiApiASR(ASRBase):
     def segments_end_ts(self, res):
         return [s["end"] for s in res.words]
 
-    def transcribe(self, audio_data, prompt=None, *args, **kwargs):
+    def transcribe(self, audio_data, init_prompt=None, *args, **kwargs):
         # Write the audio data to a buffer
         buffer = io.BytesIO()
         buffer.name = "temp.wav"
@@ -221,8 +221,8 @@ class OpenaiApiASR(ASRBase):
         }
         if self.task != "translate" and self.original_language:
             params["language"] = self.original_language
-        if prompt:
-            params["prompt"] = prompt
+        if init_prompt:
+            params["prompt"] = init_prompt
 
         if self.task == "translate":
             proc = self.client.audio.translations
