@@ -201,7 +201,7 @@ class OpenaiApiASR(ASRBase):
 
 
     def segments_end_ts(self, res):
-        return [s["end"] for s in res.words]
+        return [s["end"] for s in res.segments]
 
     def transcribe(self, audio_data, init_prompt=None, *args, **kwargs):
         # Write the audio data to a buffer
