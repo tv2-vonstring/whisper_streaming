@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 import sys
 import numpy as np
-import librosa  
+import librosa
 from functools import lru_cache
 import time
 import logging
-
 
 import io
 import soundfile as sf
@@ -13,7 +12,7 @@ import math
 
 logger = logging.getLogger(__name__)
 
-@lru_cache
+@lru_cache(10**6)
 def load_audio(fname):
     a, _ = librosa.load(fname, sr=16000, dtype=np.float32)
     return a
@@ -140,6 +139,8 @@ class FasterWhisperASR(ASRBase):
         o = []
         for segment in segments:
             for word in segment.words:
+                if segment.no_speech_prob > 0.9:
+                    continue
                 # not stripping the spaces -- should not be merged with them!
                 w = word.word
                 t = (word.start, word.end, w)
@@ -155,6 +156,117 @@ class FasterWhisperASR(ASRBase):
     def set_translate_task(self):
         self.transcribe_kargs["task"] = "translate"
 
+class MLXWhisper(ASRBase):
+    """
+    Uses MLX Whisper library as the backend, optimized for Apple Silicon.
+    Models available: https://huggingface.co/collections/mlx-community/whisper-663256f9964fbb1177db93dc
+    Significantly faster than faster-whisper (without CUDA) on Apple M1. 
+    """
+
+    sep = " "
+
+    def load_model(self, modelsize=None, cache_dir=None, model_dir=None):
+        """
+            Loads the MLX-compatible Whisper model.
+
+            Args:
+                modelsize (str, optional): The size or name of the Whisper model to load. 
+                    If provided, it will be translated to an MLX-compatible model path using the `translate_model_name` method.
+                    Example: "large-v3-turbo" -> "mlx-community/whisper-large-v3-turbo".
+                cache_dir (str, optional): Path to the directory for caching models. 
+                    **Note**: This is not supported by MLX Whisper and will be ignored.
+                model_dir (str, optional): Direct path to a custom model directory. 
+                    If specified, it overrides the `modelsize` parameter.
+        """
+        from mlx_whisper.transcribe import ModelHolder, transcribe
+        import mlx.core as mx # Is installed with mlx-whisper
+        
+        if model_dir is not None:
+            logger.debug(f"Loading whisper model from model_dir {model_dir}. modelsize parameter is not used.")
+            model_size_or_path = model_dir
+        elif modelsize is not None:
+            model_size_or_path = self.translate_model_name(modelsize)
+            logger.debug(f"Loading whisper model {modelsize}. You use mlx whisper, so {model_size_or_path} will be used.")
+        
+        self.model_size_or_path = model_size_or_path
+        
+        # Note: ModelHolder.get_model loads the model into a static class variable, 
+        # making it a global resource. This means:
+        # - Only one model can be loaded at a time; switching models requires reloading.
+        # - This approach may not be suitable for scenarios requiring multiple models simultaneously,
+        #   such as using whisper-streaming as a module with varying model sizes.
+        dtype = mx.float16 # Default to mx.float16. In mlx_whisper.transcribe: dtype = mx.float16 if decode_options.get("fp16", True) else mx.float32
+        ModelHolder.get_model(model_size_or_path, dtype) #Model is preloaded to avoid reloading during transcription
+        
+        return transcribe
+    
+    def translate_model_name(self, model_name):
+        """
+        Translates a given model name to its corresponding MLX-compatible model path.
+
+        Args:
+            model_name (str): The name of the model to translate.
+
+        Returns:
+            str: The MLX-compatible model path.
+        """
+        # Dictionary mapping model names to MLX-compatible paths
+        model_mapping = {
+            "tiny.en": "mlx-community/whisper-tiny.en-mlx",
+            "tiny": "mlx-community/whisper-tiny-mlx",
+            "base.en": "mlx-community/whisper-base.en-mlx",
+            "base": "mlx-community/whisper-base-mlx",
+            "small.en": "mlx-community/whisper-small.en-mlx",
+            "small": "mlx-community/whisper-small-mlx",
+            "medium.en": "mlx-community/whisper-medium.en-mlx",
+            "medium": "mlx-community/whisper-medium-mlx",
+            "large-v1": "mlx-community/whisper-large-v1-mlx",
+            "large-v2": "mlx-community/whisper-large-v2-mlx",
+            "large-v3": "mlx-community/whisper-large-v3-mlx",
+            "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+            "large": "mlx-community/whisper-large-mlx"
+        }
+
+        # Retrieve the corresponding MLX model path
+        mlx_model_path = model_mapping.get(model_name)
+
+        if mlx_model_path:
+            return mlx_model_path
+        else:
+            raise ValueError(f"Model name '{model_name}' is not recognized or not supported.")
+    
+    def transcribe(self, audio, init_prompt=""):
+        segments = self.model(
+            audio,
+            language=self.original_language,
+            initial_prompt=init_prompt,
+            word_timestamps=True,
+            condition_on_previous_text=True,
+            path_or_hf_repo=self.model_size_or_path,
+            **self.transcribe_kargs
+        )
+        return segments.get("segments", [])
+
+
+    def ts_words(self, segments):
+        """
+        Extract timestamped words from transcription segments and skips words with high no-speech probability.
+        """
+        return [
+            (word["start"], word["end"], word["word"])
+            for segment in segments
+            for word in segment.get("words", [])
+            if segment.get("no_speech_prob", 0) <= 0.9
+        ]
+    
+    def segments_end_ts(self, res):
+        return [s['end'] for s in res]
+
+    def use_vad(self):
+        self.transcribe_kargs["vad_filter"] = True
+
+    def set_translate_task(self):
+        self.transcribe_kargs["task"] = "translate"
 
 class OpenaiApiASR(ASRBase):
     """Uses OpenAI's Whisper API for audio transcription."""
@@ -191,17 +303,21 @@ class OpenaiApiASR(ASRBase):
 
         o = []
         for word in segments.words:
-            start = word.get("start")
-            end = word.get("end")
+            start = word.start
+            end = word.end
             if any(s[0] <= start <= s[1] for s in no_speech_segments):
                 # print("Skipping word", word.get("word"), "because it's in a no-speech segment")
                 continue
-            o.append((start, end, word.get("word")))
+            o.append((start, end, word.word))
         return o
 
 
     def segments_end_ts(self, res):
+<<<<<<< HEAD:whisper_streaming/whisper_online.py
         return [s["end"] for s in res.segments]
+=======
+        return [s.end for s in res.words]
+>>>>>>> upstream/main:whisper_online.py
 
     def transcribe(self, audio_data, init_prompt=None, *args, **kwargs):
         # Write the audio data to a buffer
@@ -330,12 +446,14 @@ class OnlineASRProcessor:
 
         self.buffer_trimming_way, self.buffer_trimming_sec = buffer_trimming
 
-    def init(self):
+    def init(self, offset=None):
         """run this when starting or restarting processing"""
         self.audio_buffer = np.array([],dtype=np.float32)
-        self.buffer_time_offset = 0
-
         self.transcript_buffer = HypothesisBuffer(logfile=self.logfile)
+        self.buffer_time_offset = 0
+        if offset is not None:
+            self.buffer_time_offset = offset
+        self.transcript_buffer.last_commited_time = self.buffer_time_offset
         self.commited = []
 
     def insert_audio_chunk(self, audio):
@@ -493,6 +611,7 @@ class OnlineASRProcessor:
         o = self.transcript_buffer.complete()
         f = self.to_flush(o)
         logger.debug(f"last, noncommited: {f}")
+        self.buffer_time_offset += len(self.audio_buffer)/16000
         return f
 
 
@@ -510,6 +629,108 @@ class OnlineASRProcessor:
             b = offset + sents[0][0]
             e = offset + sents[-1][1]
         return (b,e,t)
+
+class VACOnlineASRProcessor(OnlineASRProcessor):
+    '''Wraps OnlineASRProcessor with VAC (Voice Activity Controller). 
+
+    It works the same way as OnlineASRProcessor: it receives chunks of audio (e.g. 0.04 seconds), 
+    it runs VAD and continuously detects whether there is speech or not. 
+    When it detects end of speech (non-voice for 500ms), it makes OnlineASRProcessor to end the utterance immediately.
+    '''
+
+    def __init__(self, online_chunk_size, *a, **kw):
+        self.online_chunk_size = online_chunk_size
+
+        self.online = OnlineASRProcessor(*a, **kw)
+
+        # VAC:
+        import torch
+        model, _ = torch.hub.load(
+            repo_or_dir='snakers4/silero-vad',
+            model='silero_vad'
+        )
+        from silero_vad_iterator import FixedVADIterator
+        self.vac = FixedVADIterator(model)  # we use the default options there: 500ms silence, 100ms padding, etc.  
+
+        self.logfile = self.online.logfile
+        self.init()
+
+    def init(self):
+        self.online.init()
+        self.vac.reset_states()
+        self.current_online_chunk_buffer_size = 0
+
+        self.is_currently_final = False
+
+        self.status = None  # or "voice" or "nonvoice"
+        self.audio_buffer = np.array([],dtype=np.float32)
+        self.buffer_offset = 0  # in frames
+
+    def clear_buffer(self):
+        self.buffer_offset += len(self.audio_buffer)
+        self.audio_buffer = np.array([],dtype=np.float32)
+
+
+    def insert_audio_chunk(self, audio):
+        res = self.vac(audio)
+        self.audio_buffer = np.append(self.audio_buffer, audio)
+
+        if res is not None:
+            frame = list(res.values())[0]-self.buffer_offset
+            if 'start' in res and 'end' not in res:
+                self.status = 'voice'
+                send_audio = self.audio_buffer[frame:]
+                self.online.init(offset=(frame+self.buffer_offset)/self.SAMPLING_RATE)
+                self.online.insert_audio_chunk(send_audio)
+                self.current_online_chunk_buffer_size += len(send_audio)
+                self.clear_buffer()
+            elif 'end' in res and 'start' not in res:
+                self.status = 'nonvoice'
+                send_audio = self.audio_buffer[:frame]
+                self.online.insert_audio_chunk(send_audio)
+                self.current_online_chunk_buffer_size += len(send_audio)
+                self.is_currently_final = True
+                self.clear_buffer()
+            else:
+                beg = res["start"]-self.buffer_offset
+                end = res["end"]-self.buffer_offset
+                self.status = 'nonvoice'
+                send_audio = self.audio_buffer[beg:end]
+                self.online.init(offset=(beg+self.buffer_offset)/self.SAMPLING_RATE)
+                self.online.insert_audio_chunk(send_audio)
+                self.current_online_chunk_buffer_size += len(send_audio)
+                self.is_currently_final = True
+                self.clear_buffer()
+        else:
+            if self.status == 'voice':
+                self.online.insert_audio_chunk(self.audio_buffer)
+                self.current_online_chunk_buffer_size += len(self.audio_buffer)
+                self.clear_buffer()
+            else:
+                # We keep 1 second because VAD may later find start of voice in it.
+                # But we trim it to prevent OOM. 
+                self.buffer_offset += max(0,len(self.audio_buffer)-self.SAMPLING_RATE)
+                self.audio_buffer = self.audio_buffer[-self.SAMPLING_RATE:]
+
+
+    def process_iter(self):
+        if self.is_currently_final:
+            return self.finish()
+        elif self.current_online_chunk_buffer_size > self.SAMPLING_RATE*self.online_chunk_size:
+            self.current_online_chunk_buffer_size = 0
+            ret = self.online.process_iter()
+            return ret
+        else:
+            print("no online update, only VAD", self.status, file=self.logfile)
+            return (None, None, "")
+
+    def finish(self):
+        ret = self.online.finish()
+        self.current_online_chunk_buffer_size = 0
+        self.is_currently_final = False
+        return ret
+
+
 
 WHISPER_LANG_CODES = "af,am,ar,as,az,ba,be,bg,bn,bo,br,bs,ca,cs,cy,da,de,el,en,es,et,eu,fa,fi,fo,fr,gl,gu,ha,haw,he,hi,hr,ht,hu,hy,id,is,it,ja,jw,ka,kk,km,kn,ko,la,lb,ln,lo,lt,lv,mg,mi,mk,ml,mn,mr,ms,mt,my,ne,nl,nn,no,oc,pa,pl,ps,pt,ro,ru,sa,sd,si,sk,sl,sn,so,sq,sr,su,sv,sw,ta,te,tg,th,tk,tl,tr,tt,uk,ur,uz,vi,yi,yo,zh".split(",")
 
@@ -549,12 +770,14 @@ def add_shared_args(parser):
     parser: argparse.ArgumentParser object
     """
     parser.add_argument('--min-chunk-size', type=float, default=1.0, help='Minimum audio chunk size in seconds. It waits up to this time to do processing. If the processing takes shorter time, it waits, otherwise it processes the whole segment that was received by this time.')
-    parser.add_argument('--model', type=str, default='large-v2', choices="tiny.en,tiny,base.en,base,small.en,small,medium.en,medium,large-v1,large-v2,large-v3,large".split(","),help="Name size of the Whisper model to use (default: large-v2). The model is automatically downloaded from the model hub if not present in model cache dir.")
+    parser.add_argument('--model', type=str, default='large-v2', choices="tiny.en,tiny,base.en,base,small.en,small,medium.en,medium,large-v1,large-v2,large-v3,large,large-v3-turbo".split(","),help="Name size of the Whisper model to use (default: large-v2). The model is automatically downloaded from the model hub if not present in model cache dir.")
     parser.add_argument('--model_cache_dir', type=str, default=None, help="Overriding the default model cache dir where models downloaded from the hub are saved")
     parser.add_argument('--model_dir', type=str, default=None, help="Dir where Whisper model.bin and other files are saved. This option overrides --model and --model_cache_dir parameter.")
     parser.add_argument('--lan', '--language', type=str, default='auto', help="Source language code, e.g. en,de,cs, or 'auto' for language detection.")
     parser.add_argument('--task', type=str, default='transcribe', choices=["transcribe","translate"],help="Transcribe or translate.")
-    parser.add_argument('--backend', type=str, default="faster-whisper", choices=["faster-whisper", "whisper_timestamped", "openai-api"],help='Load only this backend for Whisper processing.')
+    parser.add_argument('--backend', type=str, default="faster-whisper", choices=["faster-whisper", "whisper_timestamped", "mlx-whisper", "openai-api"],help='Load only this backend for Whisper processing.')
+    parser.add_argument('--vac', action="store_true", default=False, help='Use VAC = voice activity controller. Recommended. Requires torch.')
+    parser.add_argument('--vac-chunk-size', type=float, default=0.04, help='VAC sample size in seconds.')
     parser.add_argument('--vad', action="store_true", default=False, help='Use VAD = voice activity detection, with the default parameters.')
     parser.add_argument('--buffer_trimming', type=str, default="segment", choices=["sentence", "segment"],help='Buffer trimming strategy -- trim completed sentences marked with punctuation mark and detected by sentence segmenter, or the completed segments returned by Whisper. Sentence segmenter must be installed for "sentence" option.')
     parser.add_argument('--buffer_trimming_sec', type=float, default=15, help='Buffer trimming length threshold in seconds. If buffer length is longer, trimming sentence/segment is triggered.')
@@ -571,6 +794,8 @@ def asr_factory(args, logfile=sys.stderr):
     else:
         if backend == "faster-whisper":
             asr_cls = FasterWhisperASR
+        elif backend == "mlx-whisper":
+            asr_cls = MLXWhisper
         else:
             asr_cls = WhisperTimestampedASR
 
@@ -601,7 +826,11 @@ def asr_factory(args, logfile=sys.stderr):
         tokenizer = None
 
     # Create the OnlineASRProcessor
-    online = OnlineASRProcessor(asr,tokenizer,logfile=logfile,buffer_trimming=(args.buffer_trimming, args.buffer_trimming_sec))
+    if args.vac:
+        
+        online = VACOnlineASRProcessor(args.min_chunk_size, asr,tokenizer,logfile=logfile,buffer_trimming=(args.buffer_trimming, args.buffer_trimming_sec))
+    else:
+        online = OnlineASRProcessor(asr,tokenizer,logfile=logfile,buffer_trimming=(args.buffer_trimming, args.buffer_trimming_sec))
 
     return asr, online
 
@@ -646,7 +875,10 @@ if __name__ == "__main__":
     logger.info("Audio duration is: %2.2f seconds" % duration)
 
     asr, online = asr_factory(args, logfile=logfile)
-    min_chunk = args.min_chunk_size
+    if args.vac:
+        min_chunk = args.vac_chunk_size
+    else:
+        min_chunk = args.min_chunk_size
 
     # load the audio into the LRU cache before we start the timer
     a = load_audio_chunk(audio_path,0,1)

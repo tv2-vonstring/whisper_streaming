@@ -16,7 +16,6 @@ parser.add_argument("--port", type=int, default=43007)
 parser.add_argument("--warmup-file", type=str, dest="warmup_file", 
         help="The path to a speech audio wav file to warm up Whisper so that the very first chunk processing is fast. It can be e.g. https://github.com/ggerganov/whisper.cpp/raw/master/samples/jfk.wav .")
 
-
 # options from whisper_online
 add_shared_args(parser)
 args = parser.parse_args()
@@ -54,7 +53,7 @@ import socket
 
 class Connection:
     '''it wraps conn object'''
-    PACKET_SIZE = 65536
+    PACKET_SIZE = 32000*5*60 # 5 minutes # was: 65536
 
     def __init__(self, conn):
         self.conn = conn
@@ -74,8 +73,11 @@ class Connection:
         return in_line
 
     def non_blocking_receive_audio(self):
-        r = self.conn.recv(self.PACKET_SIZE)
-        return r
+        try:
+            r = self.conn.recv(self.PACKET_SIZE)
+            return r
+        except ConnectionResetError:
+            return None
 
 
 import io
@@ -92,20 +94,28 @@ class ServerProcessor:
 
         self.last_end = None
 
+        self.is_first = True
+
     def receive_audio_chunk(self):
         # receive all audio that is available by this time
         # blocks operation if less than self.min_chunk seconds is available
         # unblocks if connection is closed or a chunk is available
         out = []
-        while sum(len(x) for x in out) < self.min_chunk*SAMPLING_RATE:
+        minlimit = self.min_chunk*SAMPLING_RATE
+        while sum(len(x) for x in out) < minlimit:
             raw_bytes = self.connection.non_blocking_receive_audio()
             if not raw_bytes:
                 break
+#            print("received audio:",len(raw_bytes), "bytes", raw_bytes[:10])
             sf = soundfile.SoundFile(io.BytesIO(raw_bytes), channels=1,endian="LITTLE",samplerate=SAMPLING_RATE, subtype="PCM_16",format="RAW")
             audio, _ = librosa.load(sf,sr=SAMPLING_RATE,dtype=np.float32)
             out.append(audio)
         if not out:
             return None
+        conc = np.concatenate(out)
+        if self.is_first and len(conc) < minlimit:
+            return None
+        self.is_first = False
         return np.concatenate(out)
 
     def format_output_transcript(self,o):
@@ -167,7 +177,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         conn, addr = s.accept()
         logger.info('Connected to client on {}'.format(addr))
         connection = Connection(conn)
-        proc = ServerProcessor(connection, online, min_chunk)
+        proc = ServerProcessor(connection, online, args.min_chunk_size)
         proc.process()
         conn.close()
         logger.info('Connection to client closed')

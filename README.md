@@ -43,13 +43,18 @@ Please, cite us. [ACL Anthology](https://aclanthology.org/2023.ijcnlp-demo.3/), 
 Alternative, less restrictive, but slower backend is [whisper-timestamped](https://github.com/linto-ai/whisper-timestamped): `pip install git+https://github.com/linto-ai/whisper-timestamped`
 
 Thirdly, it's also possible to run this software from the [OpenAI Whisper API](https://platform.openai.com/docs/api-reference/audio/createTranscription). This solution is fast and requires no GPU, just a small VM will suffice, but you will need to pay OpenAI for api access. Also note that, since each audio fragment is processed multiple times, the [price](https://openai.com/pricing) will be higher than obvious from the pricing page, so keep an eye on costs while using. Setting a higher chunk-size will reduce costs significantly. 
-Install with: `pip install openai`
-
+Install with: `pip install openai` , [requires Python >=3.8](https://pypi.org/project/openai/).
 For running with the openai-api backend, make sure that your [OpenAI api key](https://platform.openai.com/api-keys) is set in the `OPENAI_API_KEY` environment variable. For example, before running, do: `export OPENAI_API_KEY=sk-xxx` with *sk-xxx* replaced with your api key. 
+
+Fourthly, another efficient backend is the [Whisper MLX](https://github.com/ml-explore/mlx-examples/tree/main/whisper)  library, optimized specifically for Apple Silicon. Whisper MLX leverages the performance capabilities of Apple chips (M1, M2...) to deliver faster transcription without requiring a GPU: `pip install mlx-whisper`. All the main whisper models have been converted to the MLX format, and are listed on [Hugging Face Whisper mlx](https://huggingface.co/collections/mlx-community/whisper-663256f9964fbb1177db93dc).
+
 
 The backend is loaded only when chosen. The unused one does not have to be installed.
 
-3) Optional, not recommended: sentence segmenter (aka sentence tokenizer) 
+3) For voice activity controller: `pip install torch torchaudio`. Optional, but very recommended.
+
+<details>
+<summary>4) Optional, not recommended: sentence segmenter (aka sentence tokenizer)</summary>
 
 Two buffer trimming options are integrated and evaluated. They have impact on
 the quality and latency. The default "segment" option performs better according
@@ -70,14 +75,17 @@ following segmenters, but suggestions for better alternatives are welcome.
 - we did not find a segmenter for languages `as ba bo br bs fo haw hr ht jw lb ln lo mi nn oc sa sd sn so su sw tk tl tt` that are supported by Whisper and not by wtpsplit. The default fallback option for them is wtpsplit with unspecified language. Alternative suggestions welcome.
 
 In case of installation issues of opus-fast-mosestokenizer, especially on Windows and Mac, we recommend using only the "segment" option that does not require it.
+</details>
 
 ## Usage
 
 ### Real-time simulation from audio file
 
 ```
-usage: whisper_online.py [-h] [--min-chunk-size MIN_CHUNK_SIZE] [--model {tiny.en,tiny,base.en,base,small.en,small,medium.en,medium,large-v1,large-v2,large-v3,large}] [--model_cache_dir MODEL_CACHE_DIR] [--model_dir MODEL_DIR] [--lan LAN] [--task {transcribe,translate}]
-                         [--backend {faster-whisper,whisper_timestamped,openai-api}] [--vad] [--buffer_trimming {sentence,segment}] [--buffer_trimming_sec BUFFER_TRIMMING_SEC] [--start_at START_AT] [--offline] [--comp_unaware]
+whisper_online.py -h
+usage: whisper_online.py [-h] [--min-chunk-size MIN_CHUNK_SIZE] [--model {tiny.en,tiny,base.en,base,small.en,small,medium.en,medium,large-v1,large-v2,large-v3,large}] [--model_cache_dir MODEL_CACHE_DIR]
+                         [--model_dir MODEL_DIR] [--lan LAN] [--task {transcribe,translate}] [--backend {faster-whisper,whisper_timestamped,openai-api}] [--vac] [--vac-chunk-size VAC_CHUNK_SIZE] [--vad]
+                         [--buffer_trimming {sentence,segment}] [--buffer_trimming_sec BUFFER_TRIMMING_SEC] [-l {DEBUG,INFO,WARNING,ERROR,CRITICAL}] [--start_at START_AT] [--offline] [--comp_unaware]
                          audio_path
 
 positional arguments:
@@ -86,8 +94,9 @@ positional arguments:
 options:
   -h, --help            show this help message and exit
   --min-chunk-size MIN_CHUNK_SIZE
-                        Minimum audio chunk size in seconds. It waits up to this time to do processing. If the processing takes shorter time, it waits, otherwise it processes the whole segment that was received by this time.
-  --model {tiny.en,tiny,base.en,base,small.en,small,medium.en,medium,large-v1,large-v2,large-v3,large}
+                        Minimum audio chunk size in seconds. It waits up to this time to do processing. If the processing takes shorter time, it waits, otherwise it processes the whole segment that was
+                        received by this time.
+  --model {tiny.en,tiny,base.en,base,small.en,small,medium.en,medium,large-v1,large-v2,large-v3,large,large-v3-turbo}
                         Name size of the Whisper model to use (default: large-v2). The model is automatically downloaded from the model hub if not present in model cache dir.
   --model_cache_dir MODEL_CACHE_DIR
                         Overriding the default model cache dir where models downloaded from the hub are saved
@@ -99,11 +108,17 @@ options:
                         Transcribe or translate.
   --backend {faster-whisper,whisper_timestamped,openai-api}
                         Load only this backend for Whisper processing.
+  --vac                 Use VAC = voice activity controller. Recommended. Requires torch.
+  --vac-chunk-size VAC_CHUNK_SIZE
+                        VAC sample size in seconds.
   --vad                 Use VAD = voice activity detection, with the default parameters.
   --buffer_trimming {sentence,segment}
-                        Buffer trimming strategy -- trim completed sentences marked with punctuation mark and detected by sentence segmenter, or the completed segments returned by Whisper. Sentence segmenter must be installed for "sentence" option.
+                        Buffer trimming strategy -- trim completed sentences marked with punctuation mark and detected by sentence segmenter, or the completed segments returned by Whisper. Sentence segmenter
+                        must be installed for "sentence" option.
   --buffer_trimming_sec BUFFER_TRIMMING_SEC
                         Buffer trimming length threshold in seconds. If buffer length is longer, trimming sentence/segment is triggered.
+  -l {DEBUG,INFO,WARNING,ERROR,CRITICAL}, --log-level {DEBUG,INFO,WARNING,ERROR,CRITICAL}
+                        Set the log level
   --start_at START_AT   Start processing audio at this time.
   --offline             Offline mode.
   --comp_unaware        Computationally unaware simulation.
@@ -195,6 +210,10 @@ arecord -f S16_LE -c1 -r 16000 -t raw -D default | nc localhost 43001
 
 - nc is netcat with server's host and port
 
+### With WebSocket, FastAPI and web demo
+
+Follow https://github.com/QuentinFuxa/whisper_streaming_web . Contributed by @QuentinFuxa.
+
 
 ## Background
 
@@ -233,15 +252,18 @@ overlap, and we limit the processing buffer window.
 Contributions are welcome. We acknowledge especially:
 
 - [The GitHub contributors](https://github.com/ufal/whisper_streaming/graphs/contributors) for their pull requests with new features and bugfixes.
+- [Nice explanation video](https://www.youtube.com/watch?v=_spinzpEeFM) -- published on 31st March 2024, note that newer updates are not included.
 - [The translation of this repo into Chinese.](https://github.com/Gloridust/whisper_streaming_CN)
 - [Ondřej Plátek](https://opla.cz/) for the paper pre-review.
+
+Credits:
+
 - [Peter Polák](https://ufal.mff.cuni.cz/peter-polak) for the original idea.
 - The UEDIN team of the [ELITR project](https://elitr.eu) for the original line_packet.py.
+- Silero Team for their VAD [model](https://github.com/snakers4/silero-vad) and [VADIterator](https://github.com/ufal/whisper_streaming/blob/47caa80588ee9c0fa8945a5d05f0aea6315eb837/silero_vad.py#L8).
 
 
 ## Contact
 
 Dominik Macháček, machacek@ufal.mff.cuni.cz
-
-
 
