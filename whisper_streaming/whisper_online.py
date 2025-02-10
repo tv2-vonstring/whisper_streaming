@@ -313,11 +313,7 @@ class OpenaiApiASR(ASRBase):
 
 
     def segments_end_ts(self, res):
-<<<<<<< HEAD:whisper_streaming/whisper_online.py
         return [s["end"] for s in res.segments]
-=======
-        return [s.end for s in res.words]
->>>>>>> upstream/main:whisper_online.py
 
     def transcribe(self, audio_data, init_prompt=None, *args, **kwargs):
         # Write the audio data to a buffer
